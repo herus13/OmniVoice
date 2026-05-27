@@ -192,6 +192,22 @@ def get_parser():
         help="Language id to use when test_list JSONL entries do not contain "
         "a language_id field.",
     )
+    parser.add_argument(
+        "--silence_duration",
+        type=float,
+        default=0.3,
+        help="Total silence + cross-fade budget (seconds) inserted between "
+        "chunks for long text. Split in thirds: fade-out / silence / fade-in. "
+        "Values near 0 disable the fade and may click at seams.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible output. Sets torch.manual_seed at "
+        "the start of every generate() call: reproducible per-call, not "
+        "per-run (each batch reseeds). Omit for random output.",
+    )
     return parser
 
 

@@ -170,6 +170,8 @@ def build_demo(
         duration,
         preprocess_prompt,
         postprocess_output,
+        silence_duration,
+        seed,
         mode,
         ref_text=None,
     ):
@@ -182,6 +184,10 @@ def build_demo(
             denoise=bool(denoise) if denoise is not None else True,
             preprocess_prompt=bool(preprocess_prompt),
             postprocess_output=bool(postprocess_output),
+            silence_duration=(
+                float(silence_duration) if silence_duration is not None else 0.3
+            ),
+            seed=int(seed) if seed is not None else None,
         )
 
         lang = language if (language and language != "Auto") else None
@@ -293,7 +299,22 @@ def build_demo(
                 value=True,
                 info="Remove long silences from generated audio.",
             )
-        return ns, gs, dn, sp, du, pp, po
+            sd = gr.Slider(
+                0.0,
+                1.0,
+                value=0.3,
+                step=0.05,
+                label="Chunk Silence (seconds)",
+                info="Silence + cross-fade inserted between chunks for long "
+                "text. 0 = hard concat (may click at seams).",
+            )
+            se = gr.Number(
+                value=None,
+                precision=0,
+                label="Seed",
+                info="Set for reproducible output. Leave empty for random.",
+            )
+        return ns, gs, dn, sp, du, pp, po, sd, se
 
     with gr.Blocks(theme=theme, css=css, title="OmniVoice Demo") as demo:
         gr.Markdown(
@@ -349,6 +370,8 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             vc_du,
                             vc_pp,
                             vc_po,
+                            vc_sd,
+                            vc_se,
                         ) = _gen_settings()
                         vc_btn = gr.Button("Generate / 生成", variant="primary")
                     with gr.Column(scale=1):
@@ -359,7 +382,20 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         vc_status = gr.Textbox(label="Status / 状态", lines=2)
 
                 def _clone_fn(
-                    text, lang, ref_aud, ref_text, instruct, ns, gs, dn, sp, du, pp, po
+                    text,
+                    lang,
+                    ref_aud,
+                    ref_text,
+                    instruct,
+                    ns,
+                    gs,
+                    dn,
+                    sp,
+                    du,
+                    pp,
+                    po,
+                    sd,
+                    se,
                 ):
                     return _gen(
                         text,
@@ -373,6 +409,8 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         du,
                         pp,
                         po,
+                        sd,
+                        se,
                         mode="clone",
                         ref_text=ref_text or None,
                     )
@@ -392,6 +430,8 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         vc_du,
                         vc_pp,
                         vc_po,
+                        vc_sd,
+                        vc_se,
                     ],
                     outputs=[vc_audio, vc_status],
                 )
@@ -429,6 +469,8 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             vd_du,
                             vd_pp,
                             vd_po,
+                            vd_sd,
+                            vd_se,
                         ) = _gen_settings()
                         vd_btn = gr.Button("Generate / 生成", variant="primary")
                     with gr.Column(scale=1):
@@ -460,7 +502,9 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             parts.append(v)
                     return ", ".join(parts)
 
-                def _design_fn(text, lang, ns, gs, dn, sp, du, pp, po, *groups):
+                def _design_fn(
+                    text, lang, ns, gs, dn, sp, du, pp, po, sd, se, *groups
+                ):
                     return _gen(
                         text,
                         lang,
@@ -473,6 +517,8 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         du,
                         pp,
                         po,
+                        sd,
+                        se,
                         mode="design",
                     )
 
@@ -488,6 +534,8 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         vd_du,
                         vd_pp,
                         vd_po,
+                        vd_sd,
+                        vd_se,
                     ]
                     + vd_groups,
                     outputs=[vd_audio, vd_status],
