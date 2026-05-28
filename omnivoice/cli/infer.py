@@ -26,7 +26,7 @@ import torch
 
 import soundfile as sf
 
-from omnivoice.models.omnivoice import OmniVoice
+from omnivoice.models.omnivoice import OmniVoice, VoiceClonePrompt
 from omnivoice.utils.common import get_best_device, str2bool
 
 
@@ -66,6 +66,13 @@ def get_parser() -> argparse.ArgumentParser:
         default=None,
         help="Reference text describing the reference audio.",
     )
+    parser.add_argument(
+        "--voice_clone_prompt",
+        type=str,
+        default=None,
+        help="Path to a saved voice clone prompt (from omnivoice-create-prompt). "
+        "Reuses a pre-encoded reference; overrides --ref_audio/--ref_text.",
+    )
     # Voice design
     parser.add_argument(
         "--instruct",
@@ -102,6 +109,21 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--position_temperature", type=float, default=5.0)
     parser.add_argument("--class_temperature", type=float, default=0.0)
     parser.add_argument(
+        "--silence_duration",
+        type=float,
+        default=0.3,
+        help="Total silence + cross-fade budget (seconds) inserted between "
+        "chunks for long text. Split in thirds: fade-out / silence / fade-in. "
+        "Values near 0 disable the fade and may click at seams.",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducible output. Applied via "
+        "torch.manual_seed at the start of generation. Omit for random output.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -122,12 +144,18 @@ def main():
         args.model, device_map=device, dtype=torch.float16
     )
 
+    voice_clone_prompt = None
+    if args.voice_clone_prompt:
+        logging.info(f"Loading voice clone prompt from {args.voice_clone_prompt} ...")
+        voice_clone_prompt = VoiceClonePrompt.load(args.voice_clone_prompt)
+
     logging.info(f"Generating audio for: {args.text[:80]}...")
     audios = model.generate(
         text=args.text,
         language=args.language,
         ref_audio=args.ref_audio,
         ref_text=args.ref_text,
+        voice_clone_prompt=voice_clone_prompt,
         instruct=args.instruct,
         duration=args.duration,
         num_step=args.num_step,
@@ -139,6 +167,8 @@ def main():
         layer_penalty_factor=args.layer_penalty_factor,
         position_temperature=args.position_temperature,
         class_temperature=args.class_temperature,
+        silence_duration=args.silence_duration,
+        seed=args.seed,
     )
 
     sf.write(args.output, audios[0], model.sampling_rate)

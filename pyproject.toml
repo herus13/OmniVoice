@@ -58,6 +58,8 @@ eval = [
 omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
 omnivoice-demo = "omnivoice.cli.demo:main"
+omnivoice-dialogue = "omnivoice.cli.dialogue:main"
+omnivoice-create-prompt = "omnivoice.cli.create_prompt:main"
 
 [project.urls]
 Homepage = "https://github.com/k2-fsa/OmniVoice"

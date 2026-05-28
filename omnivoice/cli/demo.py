@@ -25,6 +25,7 @@ Usage:
 
 import argparse
 import logging
+from pathlib import Path
 from typing import Any, Dict
 
 import gradio as gr
@@ -32,8 +33,13 @@ import numpy as np
 import torch
 
 from omnivoice import OmniVoice, OmniVoiceGenerationConfig
+from omnivoice.cli.dialogue import INTER_TURN_GAP_S
+from omnivoice.models.omnivoice import VoiceClonePrompt
 from omnivoice.utils.common import get_best_device
 from omnivoice.utils.lang_map import LANG_NAMES, lang_display_name
+
+# Dropdown sentinel for "no saved voice selected".
+_NO_SAVED_VOICE = "(none)"
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +147,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="ASR model path or HuggingFace repo id"
         " (default: openai/whisper-large-v3-turbo).",
     )
+    parser.add_argument(
+        "--prompts-dir",
+        default="omnivoice_voices",
+        help="Directory where saved voice clone prompts (.pt) are stored and "
+        "listed in the Voice Clone tab (default: ./omnivoice_voices).",
+    )
     return parser
 
 
@@ -153,9 +165,66 @@ def build_demo(
     model: OmniVoice,
     checkpoint: str,
     generate_fn=None,
+    prompts_dir: str = "omnivoice_voices",
 ) -> gr.Blocks:
 
     sampling_rate = model.sampling_rate
+
+    prompts_path = Path(prompts_dir)
+    prompts_path.mkdir(parents=True, exist_ok=True)
+
+    def _list_prompts():
+        return sorted(p.stem for p in prompts_path.glob("*.pt"))
+
+    def _saved_choices():
+        return [_NO_SAVED_VOICE] + _list_prompts()
+
+    def _sanitize_name(name: str) -> str:
+        safe = "".join(
+            c for c in (name or "") if c.isalnum() or c in (" ", "-", "_")
+        ).strip()
+        return safe.replace(" ", "_")
+
+    def _save_voice(ref_audio, ref_text, name):
+        if not ref_audio:
+            return "Upload a reference audio first.", gr.update()
+        safe = _sanitize_name(name)
+        if not safe:
+            return "Enter a valid name for the voice.", gr.update()
+        try:
+            prompt = model.create_voice_clone_prompt(
+                ref_audio=ref_audio, ref_text=(ref_text or None)
+            )
+            prompt.save(str(prompts_path / f"{safe}.pt"), model=checkpoint)
+        except Exception as e:
+            return f"Error: {type(e).__name__}: {e}", gr.update()
+        return (
+            f"Saved voice '{safe}'.",
+            gr.update(choices=_saved_choices(), value=safe),
+        )
+
+    def _save_design_voice(audio, text, name):
+        # Capture the voice the user just heard (no re-generation, which
+        # would sample a different random design voice).
+        if audio is None:
+            return "Generate a voice first, then save.", gr.update()
+        safe = _sanitize_name(name)
+        if not safe:
+            return "Enter a valid name for the voice.", gr.update()
+        sr, arr = audio
+        wav = np.asarray(arr).astype(np.float32) / 32767.0
+        try:
+            prompt = model.create_voice_clone_prompt(
+                ref_audio=(torch.from_numpy(wav), int(sr)),
+                ref_text=(text.strip() if text and text.strip() else None),
+            )
+            prompt.save(str(prompts_path / f"{safe}.pt"), model=checkpoint)
+        except Exception as e:
+            return f"Error: {type(e).__name__}: {e}", gr.update()
+        return (
+            f"Saved designed voice '{safe}'. Pick it in the Voice Clone tab.",
+            gr.update(choices=_saved_choices(), value=safe),
+        )
 
     # -- shared generation core --
     def _gen_core(
@@ -170,8 +239,11 @@ def build_demo(
         duration,
         preprocess_prompt,
         postprocess_output,
+        silence_duration,
+        seed,
         mode,
         ref_text=None,
+        saved_voice=None,
     ):
         if not text or not text.strip():
             return None, "Please enter the text to synthesize."
@@ -182,6 +254,10 @@ def build_demo(
             denoise=bool(denoise) if denoise is not None else True,
             preprocess_prompt=bool(preprocess_prompt),
             postprocess_output=bool(postprocess_output),
+            silence_duration=(
+                float(silence_duration) if silence_duration is not None else 0.3
+            ),
+            seed=int(seed) if seed is not None else None,
         )
 
         lang = language if (language and language != "Auto") else None
@@ -196,12 +272,18 @@ def build_demo(
             kw["duration"] = float(duration)
 
         if mode == "clone":
-            if not ref_audio:
-                return None, "Please upload a reference audio."
-            kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-            )
+            if saved_voice and saved_voice != _NO_SAVED_VOICE:
+                path = prompts_path / f"{saved_voice}.pt"
+                if not path.is_file():
+                    return None, f"Saved voice not found: {saved_voice}"
+                kw["voice_clone_prompt"] = VoiceClonePrompt.load(str(path))
+            elif ref_audio:
+                kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                )
+            else:
+                return None, "Upload a reference audio or pick a saved voice."
 
         if instruct and instruct.strip():
             kw["instruct"] = instruct.strip()
@@ -216,6 +298,90 @@ def build_demo(
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
     _gen = generate_fn if generate_fn is not None else _gen_core
+
+    # -- multi-speaker dialogue core --
+    def _run_dialogue(
+        a_audio,
+        a_ref_text,
+        a_instruct,
+        b_audio,
+        b_ref_text,
+        b_instruct,
+        script,
+        language,
+        seed,
+    ):
+        if not script or not script.strip():
+            return None, "Please enter a dialogue script."
+
+        # Parse "A: text" / "B: text" lines into ordered turns.
+        turns = []
+        for ln_no, raw in enumerate(script.splitlines(), 1):
+            line = raw.strip()
+            if not line:
+                continue
+            if ":" not in line:
+                return None, f"Line {ln_no}: expected 'A: text' or 'B: text'."
+            label, text = line.split(":", 1)
+            label, text = label.strip().upper(), text.strip()
+            if label not in ("A", "B"):
+                return None, f"Line {ln_no}: speaker '{label}' must be A or B."
+            if not text:
+                return None, f"Line {ln_no}: empty text."
+            turns.append((label, text))
+
+        if not turns:
+            return None, "No turns parsed from script."
+
+        # Configure a voice for each label actually used (clone if reference
+        # audio given, else voice design via instruct).
+        cfg = {
+            "A": (a_audio, a_ref_text, a_instruct),
+            "B": (b_audio, b_ref_text, b_instruct),
+        }
+        voices = {}
+        for label in {lbl for lbl, _ in turns}:
+            ref_aud, ref_txt, instr = cfg[label]
+            if ref_aud:
+                voices[label] = (
+                    "clone",
+                    model.create_voice_clone_prompt(
+                        ref_audio=ref_aud, ref_text=ref_txt or None
+                    ),
+                )
+            elif instr and instr.strip():
+                voices[label] = ("design", instr.strip())
+            else:
+                return None, (
+                    f"Speaker {label} is used in the script but has no "
+                    "reference audio or instruct."
+                )
+
+        lang = language if (language and language != "Auto") else None
+        seed_val = int(seed) if seed is not None else None
+
+        try:
+            gap = np.zeros(
+                int(INTER_TURN_GAP_S * sampling_rate), dtype=np.float32
+            )
+            segments = []
+            for label, text in turns:
+                mode, val = voices[label]
+                kw: Dict[str, Any] = dict(text=text, language=lang, seed=seed_val)
+                if mode == "clone":
+                    kw["voice_clone_prompt"] = val
+                else:
+                    kw["instruct"] = val
+                audio = model.generate(**kw)[0]
+                if segments:
+                    segments.append(gap)
+                segments.append(audio.astype(np.float32))
+            conversation = np.concatenate(segments)
+        except Exception as e:
+            return None, f"Error: {type(e).__name__}: {e}"
+
+        waveform = (conversation * 32767).astype(np.int16)
+        return (sampling_rate, waveform), f"Done. {len(turns)} turns."
 
     # =====================================================================
     # UI
@@ -293,7 +459,22 @@ def build_demo(
                 value=True,
                 info="Remove long silences from generated audio.",
             )
-        return ns, gs, dn, sp, du, pp, po
+            sd = gr.Slider(
+                0.0,
+                1.0,
+                value=0.3,
+                step=0.05,
+                label="Chunk Silence (seconds)",
+                info="Silence + cross-fade inserted between chunks for long "
+                "text. 0 = hard concat (may click at seams).",
+            )
+            se = gr.Number(
+                value=None,
+                precision=0,
+                label="Seed",
+                info="Set for reproducible output. Leave empty for random.",
+            )
+        return ns, gs, dn, sp, du, pp, po, sd, se
 
     with gr.Blocks(theme=theme, css=css, title="OmniVoice Demo") as demo:
         gr.Markdown(
@@ -338,6 +519,27 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             placeholder="Transcript of the reference audio. Leave empty"
                             " to auto-transcribe via ASR models.",
                         )
+                        with gr.Accordion("Saved Voices", open=False):
+                            vc_saved = gr.Dropdown(
+                                label="Use a saved voice (skips reference above)",
+                                choices=_saved_choices(),
+                                value=_NO_SAVED_VOICE,
+                                info="Pick a previously saved voice to clone "
+                                "without re-uploading or re-encoding.",
+                            )
+                            with gr.Row():
+                                vc_save_name = gr.Textbox(
+                                    label="Save current reference as",
+                                    placeholder="my_voice",
+                                    scale=3,
+                                )
+                                vc_save_btn = gr.Button("Save", scale=1)
+                            vc_refresh_btn = gr.Button("Refresh list")
+                            vc_save_status = gr.Textbox(
+                                label="Saved Voice Status",
+                                lines=1,
+                                interactive=False,
+                            )
                         vc_lang = _lang_dropdown("Language (optional) / 语种 (可选)")
                         with gr.Accordion("Instruct (optional)", open=False):
                             vc_instruct = gr.Textbox(label="Instruct", lines=2)
@@ -349,6 +551,8 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             vc_du,
                             vc_pp,
                             vc_po,
+                            vc_sd,
+                            vc_se,
                         ) = _gen_settings()
                         vc_btn = gr.Button("Generate / 生成", variant="primary")
                     with gr.Column(scale=1):
@@ -359,7 +563,21 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         vc_status = gr.Textbox(label="Status / 状态", lines=2)
 
                 def _clone_fn(
-                    text, lang, ref_aud, ref_text, instruct, ns, gs, dn, sp, du, pp, po
+                    text,
+                    lang,
+                    ref_aud,
+                    ref_text,
+                    instruct,
+                    ns,
+                    gs,
+                    dn,
+                    sp,
+                    du,
+                    pp,
+                    po,
+                    sd,
+                    se,
+                    saved,
                 ):
                     return _gen(
                         text,
@@ -373,8 +591,11 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         du,
                         pp,
                         po,
+                        sd,
+                        se,
                         mode="clone",
                         ref_text=ref_text or None,
+                        saved_voice=saved,
                     )
 
                 vc_btn.click(
@@ -392,8 +613,21 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         vc_du,
                         vc_pp,
                         vc_po,
+                        vc_sd,
+                        vc_se,
+                        vc_saved,
                     ],
                     outputs=[vc_audio, vc_status],
+                )
+
+                vc_save_btn.click(
+                    _save_voice,
+                    inputs=[vc_ref_audio, vc_ref_text, vc_save_name],
+                    outputs=[vc_save_status, vc_saved],
+                )
+                vc_refresh_btn.click(
+                    lambda: gr.update(choices=_saved_choices()),
+                    outputs=[vc_saved],
                 )
 
             # ==============================================================
@@ -429,6 +663,8 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             vd_du,
                             vd_pp,
                             vd_po,
+                            vd_sd,
+                            vd_se,
                         ) = _gen_settings()
                         vd_btn = gr.Button("Generate / 生成", variant="primary")
                     with gr.Column(scale=1):
@@ -437,6 +673,21 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             type="numpy",
                         )
                         vd_status = gr.Textbox(label="Status / 状态", lines=2)
+                        with gr.Accordion(
+                            "Save this voice for reuse", open=False
+                        ):
+                            vd_save_name = gr.Textbox(
+                                label="Save the generated voice as",
+                                placeholder="my_designed_voice",
+                                info="Captures the voice you just generated so "
+                                "it can be reused from the Voice Clone tab.",
+                            )
+                            vd_save_btn = gr.Button("Save voice")
+                            vd_save_status = gr.Textbox(
+                                label="Saved Voice Status",
+                                lines=1,
+                                interactive=False,
+                            )
 
                 def _build_instruct(groups):
                     """Extract instruct text from UI dropdowns.
@@ -460,7 +711,9 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                             parts.append(v)
                     return ", ".join(parts)
 
-                def _design_fn(text, lang, ns, gs, dn, sp, du, pp, po, *groups):
+                def _design_fn(
+                    text, lang, ns, gs, dn, sp, du, pp, po, sd, se, *groups
+                ):
                     return _gen(
                         text,
                         lang,
@@ -473,6 +726,8 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         du,
                         pp,
                         po,
+                        sd,
+                        se,
                         mode="design",
                     )
 
@@ -488,9 +743,100 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         vd_du,
                         vd_pp,
                         vd_po,
+                        vd_sd,
+                        vd_se,
                     ]
                     + vd_groups,
                     outputs=[vd_audio, vd_status],
+                )
+
+                # Capture the generated design voice; also refresh the Voice
+                # Clone tab's saved-voice dropdown so it is reusable there.
+                vd_save_btn.click(
+                    _save_design_voice,
+                    inputs=[vd_audio, vd_text, vd_save_name],
+                    outputs=[vd_save_status, vc_saved],
+                )
+
+            # ==============================================================
+            # Dialogue (multi-speaker)
+            # ==============================================================
+            with gr.TabItem("Dialogue"):
+                gr.Markdown(
+                    "Synthesize a two-speaker conversation into one audio. "
+                    "Configure **Speaker A** and **Speaker B** below, then "
+                    "write the script with one turn per line, prefixed by "
+                    "`A:` or `B:`. Each speaker uses reference audio if "
+                    "provided, otherwise the instruct text."
+                )
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        with gr.Group():
+                            gr.Markdown("### Speaker A")
+                            dlg_a_audio = gr.Audio(
+                                label="A — Reference Audio (optional)",
+                                type="filepath",
+                                elem_classes="compact-audio",
+                            )
+                            dlg_a_ref_text = gr.Textbox(
+                                label="A — Reference Text (optional)", lines=1
+                            )
+                            dlg_a_instruct = gr.Textbox(
+                                label="A — Instruct (used if no reference audio)",
+                                lines=1,
+                                placeholder="e.g. male, middle-aged",
+                            )
+                        with gr.Group():
+                            gr.Markdown("### Speaker B")
+                            dlg_b_audio = gr.Audio(
+                                label="B — Reference Audio (optional)",
+                                type="filepath",
+                                elem_classes="compact-audio",
+                            )
+                            dlg_b_ref_text = gr.Textbox(
+                                label="B — Reference Text (optional)", lines=1
+                            )
+                            dlg_b_instruct = gr.Textbox(
+                                label="B — Instruct (used if no reference audio)",
+                                lines=1,
+                                placeholder="e.g. female, young adult",
+                            )
+                        dlg_script = gr.Textbox(
+                            label="Dialogue Script",
+                            lines=8,
+                            placeholder="A: Hi there, how are you?\n"
+                            "B: I'm great, thanks for asking!\n"
+                            "A: Glad to hear it.",
+                        )
+                        dlg_lang = _lang_dropdown()
+                        dlg_seed = gr.Number(
+                            value=None,
+                            precision=0,
+                            label="Seed",
+                            info="Set for reproducible output. Empty = random.",
+                        )
+                        dlg_btn = gr.Button("Generate / 生成", variant="primary")
+                    with gr.Column(scale=1):
+                        dlg_audio = gr.Audio(
+                            label="Conversation / 对话结果",
+                            type="numpy",
+                        )
+                        dlg_status = gr.Textbox(label="Status / 状态", lines=2)
+
+                dlg_btn.click(
+                    _run_dialogue,
+                    inputs=[
+                        dlg_a_audio,
+                        dlg_a_ref_text,
+                        dlg_a_instruct,
+                        dlg_b_audio,
+                        dlg_b_ref_text,
+                        dlg_b_instruct,
+                        dlg_script,
+                        dlg_lang,
+                        dlg_seed,
+                    ],
+                    outputs=[dlg_audio, dlg_status],
                 )
 
     return demo
@@ -525,7 +871,7 @@ def main(argv=None) -> int:
     )
     print("Model loaded.")
 
-    demo = build_demo(model, checkpoint)
+    demo = build_demo(model, checkpoint, prompts_dir=args.prompts_dir)
 
     demo.queue().launch(
         server_name=args.ip,

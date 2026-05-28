@@ -87,11 +87,58 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+_VOICE_CLONE_PROMPT_FORMAT = "omnivoice-voice-clone-prompt"
+
+
 @dataclass
 class VoiceClonePrompt:
     ref_audio_tokens: torch.Tensor  # (C, T)
     ref_text: str
     ref_rms: float
+
+    def save(self, path: str, model: Optional[str] = None) -> None:
+        """Serialize this prompt to ``path`` for reuse without re-encoding.
+
+        Tokens are moved to CPU so the file is portable across devices; the
+        consuming model moves them back to its device at generation time.
+
+        Args:
+            path: Output file path (conventionally ``.pt``).
+            model: Optional model id/path, stored for human debugging only.
+        """
+        torch.save(
+            {
+                "format": _VOICE_CLONE_PROMPT_FORMAT,
+                "version": 1,
+                "ref_audio_tokens": self.ref_audio_tokens.cpu(),
+                "ref_text": self.ref_text,
+                "ref_rms": self.ref_rms,
+                "model": model,
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path: str) -> "VoiceClonePrompt":
+        """Load a prompt previously written by :meth:`save`.
+
+        Loaded with ``weights_only=True``; the saved payload contains only
+        tensors and primitives, so this is safe against arbitrary-code
+        execution from a malicious file.
+        """
+        obj = torch.load(path, map_location="cpu", weights_only=True)
+        if not (
+            isinstance(obj, dict) and obj.get("format") == _VOICE_CLONE_PROMPT_FORMAT
+        ):
+            raise ValueError(
+                f"{path} is not an OmniVoice voice clone prompt file "
+                "(create one with `omnivoice-create-prompt`)."
+            )
+        return cls(
+            ref_audio_tokens=obj["ref_audio_tokens"],
+            ref_text=obj["ref_text"],
+            ref_rms=obj["ref_rms"],
+        )
 
 
 @dataclass
@@ -107,6 +154,8 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    silence_duration: float = 0.3
+    seed: Optional[int] = None
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -128,6 +177,11 @@ class GenerationTask:
     speed: Optional[List[float]] = None
 
     def get_indices(self, config: OmniVoiceGenerationConfig, frame_rate: int):
+        # audio_chunk_duration <= 0 disables chunking: every item is generated
+        # in a single pass regardless of estimated duration (matches the
+        # documented "not split" behaviour).
+        if config.audio_chunk_duration <= 0:
+            return list(range(len(self.target_lens))), []
         threshold = int(config.audio_chunk_threshold * frame_rate)
         short_idx = [i for i, l in enumerate(self.target_lens) if l <= threshold]
         long_idx = [i for i, l in enumerate(self.target_lens) if l > threshold]
@@ -539,6 +593,14 @@ class OmniVoice(PreTrainedModel):
                     this duration (seconds) and generate chunk by chunk.
                 audio_chunk_threshold: Only apply chunking if estimated audio
                     duration exceeds this threshold (seconds).
+                silence_duration: Total silence + cross-fade budget (seconds)
+                    inserted between chunks when chunking is active. Split in
+                    thirds: fade-out / silence / fade-in. Values near 0 disable
+                    the fade and concatenate hard (may click at seams).
+                seed: If set, calls ``torch.manual_seed`` at the start of this
+                    ``generate`` call for reproducible output. Seeds torch
+                    (CPU/CUDA/MPS) only, not numpy/random. Re-applied on every
+                    call — reproducible per-call, not per-run.
         Returns:
             ``audios`` a list of 1-D ``np.ndarray`` with shape ``(T,)`` and
             sampling rate consistent with the model's audio tokenizer
@@ -558,6 +620,12 @@ class OmniVoice(PreTrainedModel):
         )
 
         self.eval()
+
+        # Seed before any RNG is consumed (preprocessing may invoke ASR).
+        # Covers torch CPU/CUDA/MPS only — not numpy/random — so reproducibility
+        # holds for the iterative decoder, the dominant randomness source.
+        if gen_config.seed is not None:
+            torch.manual_seed(gen_config.seed)
 
         full_task = self._preprocess_all(
             text=text,
@@ -731,7 +799,11 @@ class OmniVoice(PreTrainedModel):
                 .numpy()
                 for t in tokens
             ]
-            audio_waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
+            audio_waveform = cross_fade_chunks(
+                chunk_audios,
+                self.sampling_rate,
+                silence_duration=gen_config.silence_duration,
+            )
         else:
             audio_waveform = (
                 self.audio_tokenizer.decode(tokens.to(tokenizer_device).unsqueeze(0))
