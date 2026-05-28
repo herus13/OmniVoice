@@ -26,7 +26,7 @@ import torch
 
 import soundfile as sf
 
-from omnivoice.models.omnivoice import OmniVoice
+from omnivoice.models.omnivoice import OmniVoice, VoiceClonePrompt
 from omnivoice.utils.common import get_best_device, str2bool
 
 
@@ -65,6 +65,13 @@ def get_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Reference text describing the reference audio.",
+    )
+    parser.add_argument(
+        "--voice_clone_prompt",
+        type=str,
+        default=None,
+        help="Path to a saved voice clone prompt (from omnivoice-create-prompt). "
+        "Reuses a pre-encoded reference; overrides --ref_audio/--ref_text.",
     )
     # Voice design
     parser.add_argument(
@@ -137,12 +144,18 @@ def main():
         args.model, device_map=device, dtype=torch.float16
     )
 
+    voice_clone_prompt = None
+    if args.voice_clone_prompt:
+        logging.info(f"Loading voice clone prompt from {args.voice_clone_prompt} ...")
+        voice_clone_prompt = VoiceClonePrompt.load(args.voice_clone_prompt)
+
     logging.info(f"Generating audio for: {args.text[:80]}...")
     audios = model.generate(
         text=args.text,
         language=args.language,
         ref_audio=args.ref_audio,
         ref_text=args.ref_text,
+        voice_clone_prompt=voice_clone_prompt,
         instruct=args.instruct,
         duration=args.duration,
         num_step=args.num_step,

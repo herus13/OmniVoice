@@ -87,11 +87,58 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+_VOICE_CLONE_PROMPT_FORMAT = "omnivoice-voice-clone-prompt"
+
+
 @dataclass
 class VoiceClonePrompt:
     ref_audio_tokens: torch.Tensor  # (C, T)
     ref_text: str
     ref_rms: float
+
+    def save(self, path: str, model: Optional[str] = None) -> None:
+        """Serialize this prompt to ``path`` for reuse without re-encoding.
+
+        Tokens are moved to CPU so the file is portable across devices; the
+        consuming model moves them back to its device at generation time.
+
+        Args:
+            path: Output file path (conventionally ``.pt``).
+            model: Optional model id/path, stored for human debugging only.
+        """
+        torch.save(
+            {
+                "format": _VOICE_CLONE_PROMPT_FORMAT,
+                "version": 1,
+                "ref_audio_tokens": self.ref_audio_tokens.cpu(),
+                "ref_text": self.ref_text,
+                "ref_rms": self.ref_rms,
+                "model": model,
+            },
+            path,
+        )
+
+    @classmethod
+    def load(cls, path: str) -> "VoiceClonePrompt":
+        """Load a prompt previously written by :meth:`save`.
+
+        Loaded with ``weights_only=True``; the saved payload contains only
+        tensors and primitives, so this is safe against arbitrary-code
+        execution from a malicious file.
+        """
+        obj = torch.load(path, map_location="cpu", weights_only=True)
+        if not (
+            isinstance(obj, dict) and obj.get("format") == _VOICE_CLONE_PROMPT_FORMAT
+        ):
+            raise ValueError(
+                f"{path} is not an OmniVoice voice clone prompt file "
+                "(create one with `omnivoice-create-prompt`)."
+            )
+        return cls(
+            ref_audio_tokens=obj["ref_audio_tokens"],
+            ref_text=obj["ref_text"],
+            ref_rms=obj["ref_rms"],
+        )
 
 
 @dataclass
